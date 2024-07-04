@@ -16,8 +16,7 @@ shared_key = os.environ['WorkspaceKey']
 auth_token = os.environ['MiroAccessToken']
 connection_string = os.environ['AzureWebJobsStorage']
 log_type = 'Miro_Auditlogs'
-# v2 doesn't return size in response.
-miro_api_url = "https://api.miro.com/v1/audit/logs"
+miro_api_url = "https://api.miro.com/v2/audit/logs"
 logAnalyticsUri = os.environ.get('logAnalyticsUri')
 
 if ((logAnalyticsUri in (None, '') or str(logAnalyticsUri).isspace())):
@@ -45,70 +44,66 @@ def generate_date():
     return (past_time, current_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
 
 
-def get_result_request(offset, limit, from_time, to_time):
+def get_result_request(cursor, limit, from_time, to_time):
     try:
-        # limits on miro api while using params in body
         api_url_params = miro_api_url + \
-            f'?createdAfter={from_time}&createdBefore={to_time}&limit={limit}&offset={offset}'
+            f'?createdAfter={from_time}&createdBefore={to_time}&limit={limit}' + (f'&cursor={cursor}' if cursor else '')
+        print('this is the full API URL: {}'.format(api_url_params))
 
         r = requests.get(url=api_url_params,
-                         headers={'Authorization': f'Bearer {auth_token}'},
-                         )
+                         headers={'Authorization': f'Bearer {auth_token}'})
         if r.status_code == 200:
             logging.info("1. Miro API returned 200 OK")
             return r.json()
         elif r.status_code == 401:
-            logging.error(
-                "The authentication credentials are incorrect or missing. Error code: {}".format(r.status_code))
+            logging.error("The authentication credentials are incorrect or missing. Error code: {}".format(r.status_code))
         elif r.status_code == 403:
-            logging.error(
-                "The user does not have the required permissions. Error code: {}".format(r.status_code))
+            logging.error("The user does not have the required permissions. Error code: {}".format(r.status_code))
         else:
-            logging.error(
-                "Something went wrong. Error code: {}".format(r.status_code))
+            logging.error("Something went wrong. Error code: {}".format(r.status_code))
     except Exception as err:
-        logging.error(
-            "Something went wrong. Exception error text: {}".format(err))
+        logging.error("Something went wrong. Exception error text: {}".format(err))
 
 
 def get_result(time_range):
     from_time = time_range[0]
     to_time = time_range[1]
-    offset = 0
+    cursor = None
     limit = 500
     collected_data = []  # List of total items fetched
+    data_count = 0
 
     while True:
-        result = get_result_request(offset, limit, from_time, to_time)
-        data = result['data']
-        data_count = len(data)
-        data_total_count = result['size']
-        collected_data_count = len(collected_data)
-
-        if result is not None:
-            if offset == 0 and data_count == 0:
-                logging.info("Logs not found. Time period: from {} to {}.".format(
+        result = get_result_request(cursor, limit, from_time, to_time)
+        if result is None:
+            logging.info("Logs not found. Time period: from {} to {}.".format(
                     from_time, to_time))
-            elif collected_data_count >= data_total_count:
-                break
-            elif data_count > 0:
-                logging.info("Processing {} events".format(data_count))
-                collected_data.extend(data)  # Add data to list
-
-            offset += limit
-
-        else:
+            break
+        
+        data = result.get('data', [])
+        data_count = len(data)
+        size = result.get('size')
+        cursor = result.get('cursor')
+        if cursor:
+            cursor = urllib.parse.quote(cursor) # URL Encode cursor, else a cursor is always returned causing infinite loop
+        
+        if size == 0:
+            logging.info("Logs not found. Time period: from {} to {}.".format(from_time, to_time))
+            break
+        
+        logging.info("Processing {} events".format(data_count))
+        collected_data.extend(data)  # Add data to list
+        
+        if cursor is None:
             break
 
-    if collected_data_count > 0:
+    if collected_data:
         logging.info("2. Posting data to Sentinel")
         post_status_code = post_data(json.dumps(collected_data))
         if post_status_code is not None:
-            logging.info("Posted {} out of {} events to Azure Sentinel. Time period: from {} to {}.".format(
-                collected_data_count, data_total_count, from_time, to_time))
+            logging.info("Posted {} events to Azure Sentinel. Time period: from {} to {}.".format(len(collected_data), from_time, to_time))
     else:
-        logging.info("No events to process. Time period: from {} to {}.".format(
-            from_time, to_time))
+        logging.info("No events to process. Time period: from {} to {}.".format(from_time, to_time))
 
 
 def build_signature(customer_id, shared_key, date, content_length, method, content_type, resource):
