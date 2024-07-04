@@ -9,6 +9,7 @@ import hashlib
 import os
 import logging
 import re
+import urllib.parse
 from .state_manager import StateManager
 
 customer_id = os.environ['WorkspaceID']
